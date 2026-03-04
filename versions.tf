@@ -48,7 +48,12 @@ provider "aws" {
 provider "kubernetes" {
   host                   = aws_eks_cluster.langfuse.endpoint
   cluster_ca_certificate = base64decode(aws_eks_cluster.langfuse.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.langfuse.token
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.langfuse.name, "--region", "us-east-1"]
+  }
 }
 
 # Helm provider -- uses same EKS cluster connection
@@ -56,6 +61,11 @@ provider "helm" {
   kubernetes {
     host                   = aws_eks_cluster.langfuse.endpoint
     cluster_ca_certificate = base64decode(aws_eks_cluster.langfuse.certificate_authority[0].data)
-    token                  = data.aws_eks_cluster_auth.langfuse.token
+
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      command     = "aws"
+      args        = ["eks", "get-token", "--cluster-name", aws_eks_cluster.langfuse.name, "--region", "us-east-1"]
+    }
   }
 }

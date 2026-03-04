@@ -1,5 +1,9 @@
 # Langfuse on AWS EKS
 
+<p align="center">
+  <img src="EKS_Langfuse.gif" alt="Langfuse EKS Architecture" width="100%">
+</p>
+
 Production-ready Terraform configuration for deploying [Langfuse](https://langfuse.com)
 on Amazon EKS with Fargate, following the AWS Well-Architected Framework.
 
