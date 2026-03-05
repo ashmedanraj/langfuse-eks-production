@@ -150,4 +150,72 @@ resource "aws_iam_role_policy_attachment" "eks_service_policy" {
 resource "aws_cloudwatch_log_group" "eks" {
   name              = "/aws/eks/${var.name}/cluster"
   retention_in_days = 30
-} 
+}
+
+# =============================================================================
+# CoreDNS Fargate Toleration Fix
+# =============================================================================
+# By default CoreDNS lacks the toleration for the Fargate compute-type taint,
+# which prevents it from being scheduled. This patch adds the required
+# toleration so CoreDNS can run on Fargate nodes.
+# Without this, all pods fail to resolve DNS (cannot connect to RDS, cannot
+# pull Docker images, etc.).
+resource "terraform_data" "coredns_fargate_toleration" {
+  # Re-run only when the EKS cluster or Fargate profiles change
+  triggers_replace = [
+    aws_eks_cluster.langfuse.id,
+    join(",", [for k, v in aws_eks_fargate_profile.namespaces : v.id]),
+  ]
+
+  provisioner "local-exec" {
+    interpreter = ["PowerShell", "-Command"]
+    command     = <<-EOT
+      aws eks update-kubeconfig --name ${aws_eks_cluster.langfuse.name} --region ${data.aws_region.current.id}
+      $patch = '[{\"op\":\"add\",\"path\":\"/spec/template/spec/tolerations/-\",\"value\":{\"key\":\"eks.amazonaws.com/compute-type\",\"operator\":\"Equal\",\"value\":\"fargate\",\"effect\":\"NoSchedule\"}}]'
+      kubectl patch deployment coredns -n kube-system --type=json -p $patch
+      kubectl -n kube-system rollout status deployment/coredns --timeout=300s
+    EOT
+  }
+
+  depends_on = [
+    aws_eks_fargate_profile.namespaces,
+  ]
+}
+
+# =============================================================================
+# Fargate Logging ConfigMap (aws-logging)
+# =============================================================================
+# Required by the Fargate scheduler to enable pod logging to CloudWatch.
+# Without this, every Fargate pod emits a warning:
+#   "Disabled logging because aws-logging configmap was not found"
+resource "kubernetes_config_map" "aws_logging" {
+  metadata {
+    name      = "aws-logging"
+    namespace = "aws-observability"
+  }
+
+  data = {
+    "output.conf" = <<-EOT
+      [OUTPUT]
+          Name              cloudwatch_logs
+          Match             *
+          region            ${data.aws_region.current.id}
+          log_group_name    /aws/eks/${var.name}/fargate
+          log_stream_prefix fargate-
+          auto_create_group true
+    EOT
+  }
+
+  depends_on = [
+    kubernetes_namespace.aws_observability,
+  ]
+}
+
+resource "kubernetes_namespace" "aws_observability" {
+  metadata {
+    name = "aws-observability"
+    labels = {
+      "aws-observability" = "enabled"
+    }
+  }
+}

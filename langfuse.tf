@@ -202,7 +202,7 @@ resource "helm_release" "langfuse" {
   version    = var.langfuse_helm_chart_version
   chart      = "langfuse"
   namespace  = kubernetes_namespace.langfuse.metadata[0].name
-  timeout    = 900 # 15 minutes -- Fargate pods take longer to schedule
+  timeout    = 1200 # 20 minutes -- Fargate pods take longer to schedule
 
   values = compact([
     local.langfuse_values,
@@ -220,7 +220,8 @@ resource "helm_release" "langfuse" {
     kubernetes_persistent_volume.clickhouse_data,
     kubernetes_persistent_volume.clickhouse_zookeeper,
     kubernetes_service_account.aws_load_balancer_controller,
-    helm_release.aws_load_balancer_controller
+    helm_release.aws_load_balancer_controller,
+    terraform_data.coredns_fargate_toleration, # Ensure CoreDNS is running before deploying Langfuse
   ]
 }
 
